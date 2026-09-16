@@ -1,0 +1,108 @@
+@import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Serif:wght@500;600&family=IBM+Plex+Sans:wght@400;450;500;600;700&family=IBM+Plex+Mono:wght@400;500&display=swap');
+@import "tailwindcss";
+
+:root {
+  --bg: #faf9f5;
+  --surface: #ffffff;
+  --surface-alt: #edf1f5;
+  --border: #e2e7ed;
+  --border-2: #d2dae2;
+  --text: #16212e;
+  --text-2: #33414f;
+  --text-muted: #5c6775;
+  --accent: #1f6091;
+  --accent-2: #17496e;
+  --accent-soft: #e9f1f7;
+  --accent-contrast: #ffffff;
+  --warn: #9a620f;
+  --warn-soft: #f6ead6;
+  --critical: #b23a2e;
+  --critical-soft: #f6e1de;
+  --good: #1c7a52;
+  --good-soft: #e2f0e9;
+  --mute: #6c7783;
+  --mute-soft: #e9ecef;
+
+  --font-display: 'IBM Plex Serif', Georgia, serif;
+  --font-body: 'IBM Plex Sans', ui-sans-serif, system-ui, sans-serif;
+  --font-mono: 'IBM Plex Mono', ui-monospace, 'SF Mono', monospace;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --bg: #0f151c;
+    --surface: #161f29;
+    --surface-alt: #1d2833;
+    --border: #27333f;
+    --border-2: #31404d;
+    --text: #e8edf3;
+    --text-2: #c5cfdb;
+    --text-muted: #95a1af;
+    --accent: #65aad8;
+    --accent-2: #8fc4e5;
+    --accent-soft: #173142;
+    --accent-contrast: #0d1417;
+    --warn: #e0a340;
+    --warn-soft: #352c1a;
+    --critical: #e56a5d;
+    --critical-soft: #3a2220;
+    --good: #55ba8b;
+    --good-soft: #163127;
+    --mute: #8c96a3;
+    --mute-soft: #232c35;
+  }
+}
+
+:root[data-theme="dark"] {
+  --bg: #0f151c;
+  --surface: #161f29;
+  --surface-alt: #1d2833;
+  --border: #27333f;
+  --border-2: #31404d;
+  --text: #e8edf3;
+  --text-2: #c5cfdb;
+  --text-muted: #95a1af;
+  --accent: #65aad8;
+  --accent-2: #8fc4e5;
+  --accent-soft: #173142;
+  --accent-contrast: #0d1417;
+  --warn: #e0a340;
+  --warn-soft: #352c1a;
+  --critical: #e56a5d;
+  --critical-soft: #3a2220;
+  --good: #55ba8b;
+  --good-soft: #163127;
+  --mute: #8c96a3;
+  --mute-soft: #232c35;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html, body, #root {
+  height: 100%;
+}
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--text);
+  font-family: var(--font-body);
+  font-weight: 450;
+  -webkit-font-smoothing: antialiased;
+}
+
+h1, h2, h3, .font-display {
+  font-family: var(--font-display);
+  text-wrap: balance;
+}
+
+.font-mono, .tabular {
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+}
+
+::selection {
+  background: var(--accent-soft);
+}

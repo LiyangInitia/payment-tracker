@@ -1,0 +1,34 @@
+name: Gmail sync
+
+# Runs the deterministic sync every 30 minutes — replaces the Claude cloud
+# routine that used to fire ~17x/day as a full agent session. This is a plain
+# Node script; a run typically finishes in well under a minute.
+on:
+  schedule:
+    - cron: "*/30 * * * *"
+  workflow_dispatch: {}
+
+concurrency:
+  group: gmail-sync
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: npm install --omit=dev --no-save @supabase/supabase-js
+      - name: Run sync
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          GMAIL_CLIENT_ID: ${{ secrets.GMAIL_CLIENT_ID }}
+          GMAIL_CLIENT_SECRET: ${{ secrets.GMAIL_CLIENT_SECRET }}
+          GMAIL_REFRESH_TOKEN: ${{ secrets.GMAIL_REFRESH_TOKEN }}
+          GMAIL_USER_EMAIL: liyang@initia.sg
+          ACCOUNTS_EMAIL: accounts@initia.sg
+        run: node scripts/gmail-sync.mjs
