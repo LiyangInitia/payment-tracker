@@ -312,7 +312,7 @@ async function main() {
   const { data: freshRows, error: reloadErr } = await supabase.from('payment_requests').select('*')
   if (reloadErr) throw reloadErr
   const eligible = freshRows
-    .filter((r) => r.status !== 'cancelled' && !(r.status === 'done' && r.slip_url))
+    .filter((r) => !r.dismissed && r.status !== 'cancelled' && !(r.status === 'done' && r.slip_url))
     .sort((a, b) => (a.due_date > b.due_date ? 1 : -1))
     .slice(0, 15)
 
