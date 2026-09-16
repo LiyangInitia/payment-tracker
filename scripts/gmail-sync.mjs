@@ -167,6 +167,53 @@ function isDisregard(text) {
   return /\b(disregard|cancel|ignore this request)\b/i.test(text)
 }
 
+const MONTHS = ['jan', 'feb', 'mar', 'apr', 'may', 'jun', 'jul', 'aug', 'sep', 'oct', 'nov', 'dec']
+
+// Real emails write this as "PAYMENT DUE DATE: 17th Sep 2026" / "- Payment due
+// date: 17th September 2026" — never ISO — so this has to parse the ordinal
+// day + month name + year form, not look for YYYY-MM-DD.
+function parseDueDate(text) {
+  const m = /due\s*(?:date)?:?\s*[*_>\-\s]*(\d{1,2})(?:st|nd|rd|th)?[\s,]+([A-Za-z]+)[\s,]+(\d{4})/i.exec(text)
+  if (!m) return null
+  const day = parseInt(m[1], 10)
+  const monthIdx = MONTHS.indexOf(m[2].toLowerCase().slice(0, 3))
+  if (monthIdx === -1 || !day || day > 31) return null
+  return `${m[3]}-${String(monthIdx + 1).padStart(2, '0')}-${String(day).padStart(2, '0')}`
+}
+
+// Every request email has a consistent "Billing Entity or Billing outlet: X"
+// line — read the real entity instead of defaulting every row to one guess.
+function parseEntity(text) {
+  const m = /billing entity(?:\s*or\s*billing outlet)?:\s*(.+)/i.exec(text)
+  if (!m) return null
+  const full = m[1].trim().replace(/[*_]/g, '')
+  const short = full.replace(/\s*(pte\.?\s*ltd\.?|private\s+limited|limited|ltd\.?)\s*$/i, '').trim()
+  return { full, short: short || full }
+}
+
+// "Product or Service: Tofu G Paper Spoon" is the closest thing to a clean
+// description these emails have — prefer it over the subject line.
+function parseDescription(text, fallbackSubject) {
+  const m = /product or service:\s*(.+)/i.exec(text)
+  return m ? m[1].trim().replace(/[*_]/g, '') : fallbackSubject
+}
+
+// Subjects use at least three templates:
+//   "Payment Request to VENDOR for DESC"
+//   "Payment Request for DESC to VENDOR for DESC2"        (freight/logistics)
+//   "[Outlet] Payment request — VENDOR for DESC - sender_date"   (em dash, no "to")
+// The first two both have "to VENDOR for" somewhere; the third doesn't use
+// "to" at all. Try the "to...for" shape first, then the dash shape, then give
+// up and hand back the cleaned subject.
+function parseVendorFromSubject(rawSubject) {
+  let subject = rawSubject.replace(/^\s*(re|fwd):\s*/i, '').replace(/^\s*\[[^\]]*\]\s*/, '').replace(/^\s*(re|fwd):\s*/i, '')
+  let m = /\bto\s+(.+?)\s+for\b/i.exec(subject)
+  if (m) return m[1].trim()
+  m = /payment request\s*[—:\-]+\s*(.+?)\s+for\b/i.exec(subject)
+  if (m) return m[1].trim()
+  return subject.replace(/\s*-\s*Li Yang.*$/i, '').trim()
+}
+
 function amountVariants(amount) {
   const plain = Number(amount).toFixed(2)
   const grouped = Number(amount).toLocaleString('en-US', { minimumFractionDigits: 2 })
@@ -223,7 +270,7 @@ async function main() {
     // T2: not a re-send of an already-tracked request (same loose vendor + same
     // amount, from a DIFFERENT thread — same-thread matches are the legitimate
     // 50% deposit -> balance case).
-    const vendorGuess = (/payment request to (.+?) for/i.exec(msg.subject) || [])[1] || msg.subject
+    const vendorGuess = parseVendorFromSubject(msg.subject)
     const isDuplicate = runRows.some((r) =>
       r.request_thread_id !== msg.threadId &&
       Number(r.amount) === parsedAmount.amount &&
@@ -231,24 +278,29 @@ async function main() {
     )
     if (isDuplicate) continue
 
-    const dueDateMatch = /due\s*(?:date)?:?\s*(\d{4}-\d{2}-\d{2})/i.exec(msg.body)
+    const dueDate = parseDueDate(msg.body)
+    const entity = parseEntity(msg.body)
     const dateSent = msg.date ? new Date(msg.date).toISOString().slice(0, 10) : new Date().toISOString().slice(0, 10)
+    const verifyFlags = []
+    if (!dueDate) verifyFlags.push('due date')
+    if (!entity) verifyFlags.push('entity')
     const newRow = {
       request_message_id: msg.id,
       request_thread_id: msg.threadId,
       date_sent: dateSent,
       vendor: vendorGuess.slice(0, 80),
       vendor_full: vendorGuess,
-      description: msg.subject.replace(/^(re|fwd):\s*/i, ''),
-      entity: 'Initia International', // best-guess default; correct manually if a different billing entity applies
-      entity_full: 'Initia International Pte Ltd',
+      description: parseDescription(msg.body, msg.subject.replace(/^(re|fwd):\s*/i, '')),
+      entity: entity ? entity.short : 'Initia International',
+      entity_full: entity ? entity.full : 'Initia International Pte Ltd',
       amount: parsedAmount.amount,
       currency: parsedAmount.currency,
       method: parsedAmount.currency === 'SGD' ? 'PayNow' : 'T/T',
-      due_date: dueDateMatch ? dueDateMatch[1] : dateSent,
+      due_date: dueDate || dateSent,
       status: 'pending',
       email_url: gmailUrl(msg.id),
-      notes: `Auto-added from sent mail on ${new Date().toISOString().slice(0, 10)}. (verify: entity, description, due date parsed automatically)`,
+      notes: `Auto-added from sent mail on ${new Date().toISOString().slice(0, 10)}.` +
+        (verifyFlags.length ? ` (verify: ${verifyFlags.join(', ')} — could not parse from email)` : ''),
     }
     const { data: inserted, error: insErr } = await supabase.from('payment_requests').insert(newRow).select().single()
     if (insErr) { console.error('Insert failed for', msg.id, insErr.message); continue }
@@ -279,10 +331,10 @@ async function main() {
         const nameMatch = /(?:PayNow Recipient Name|Name):\s*(.+)/i.exec(msg.body)
         const beneficiary = nameMatch ? nameMatch[1].split('\n')[0].trim() : ''
         const beneficiaryMatches = beneficiary && looseVendorMatch(beneficiary, row.vendor_full || row.vendor)
+        const refMatch = /OCBC reference no\.?:\s*(\S+)/i.exec(msg.body)
+        const dateMatch = /Value date[^:]*:\s*(\d{1,2}\s+\w+\s+\d{4})/i.exec(msg.body)
 
         if (amtMatch && beneficiaryMatches) {
-          const refMatch = /OCBC reference no\.?:\s*(\S+)/i.exec(msg.body)
-          const dateMatch = /Value date[^:]*:\s*(\d{1,2}\s+\w+\s+\d{4})/i.exec(msg.body)
           const paymentDate = dateMatch ? new Date(dateMatch[1]).toISOString().slice(0, 10) : new Date().toISOString().slice(0, 10)
           await supabase.from('payment_requests').update({
             status: 'done',
@@ -296,10 +348,15 @@ async function main() {
           matched = true
           break
         } else if (amtMatch && !matched) {
-          // Near miss: right amount, unconfirmed beneficiary — leave a breadcrumb, don't settle.
-          await supabase.from('payment_requests').update({
-            notes: `${row.notes || ''} Possible payment seen: OCBC ${row.currency} ${plain}${refMatch ? '' : ''} - verify.`.trim(),
-          }).eq('id', row.id)
+          // Near miss: right amount, unconfirmed beneficiary — leave a breadcrumb, don't
+          // settle. Guarded so reruns don't pile up the same breadcrumb every 30 minutes.
+          const breadcrumb = `Possible payment seen: OCBC ${row.currency} ${plain}${refMatch ? ` ref ${refMatch[1]}` : ''} - verify.`
+          if (!(row.notes || '').includes(breadcrumb)) {
+            await supabase.from('payment_requests').update({
+              notes: `${row.notes || ''} ${breadcrumb}`.trim(),
+            }).eq('id', row.id)
+            row.notes = `${row.notes || ''} ${breadcrumb}`.trim()
+          }
         }
       }
       if (matched) break
