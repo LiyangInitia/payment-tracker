@@ -147,6 +147,28 @@ function looseVendorMatch(a, b) {
   return na.includes(nb) || nb.includes(na)
 }
 
+// Cuts a reply body down to only what was newly typed, dropping quoted
+// history beneath it. Deliberately does NOT treat a line starting with ">"
+// as a quote marker — the request template itself uses ">>> AMOUNT: ..." /
+// ">>> PAYMENT DUE DATE: ..." as bullet emphasis, not as a reply quote, so
+// that heuristic would truncate the very fields we need to parse. Instead
+// this looks for the structural markers Gmail/Outlook actually insert.
+function stripQuotedText(text) {
+  if (!text) return ''
+  const markers = [
+    /^on .{0,200}wrote:\s*$/im,
+    /^-{2,}\s*(?:original|forwarded) message\s*-{2,}/im,
+    /^_{5,}\s*$/m,
+    /^from:\s*.+\n+(?:sent|date):\s*.+\n+to:\s*.+\n+subject:/im,
+  ]
+  let cutIndex = text.length
+  for (const re of markers) {
+    const m = re.exec(text)
+    if (m && m.index < cutIndex) cutIndex = m.index
+  }
+  return text.slice(0, cutIndex).trim()
+}
+
 function hasIntentLine(text) {
   return /please proceed with payment/i.test(text) || /payment info/i.test(text) || /product or service:/i.test(text)
 }
@@ -164,7 +186,7 @@ function parseAmountLine(text) {
 }
 
 function isDisregard(text) {
-  return /\b(disregard|cancel|ignore this request)\b/i.test(text)
+  return /\b(disregard|kindly ignore|please ignore|cancel this (?:request|payment)|ignore this request)\b/i.test(text)
 }
 
 const MONTHS = ['jan', 'feb', 'mar', 'apr', 'may', 'jun', 'jul', 'aug', 'sep', 'oct', 'nov', 'dec']
@@ -196,6 +218,31 @@ function parseEntity(text) {
 function parseDescription(text, fallbackSubject) {
   const m = /product or service:\s*(.+)/i.exec(text)
   return m ? m[1].trim().replace(/[*_]/g, '') : fallbackSubject
+}
+
+// Every request email's "Beneficiary information" block names the true
+// payee (e.g. "Holder Name: Zhejiang Zhuzhi Industry and Trade Co., Ltd."),
+// and this is the exact string the OCBC advice later echoes back in its own
+// "Name:" field — far more reliable than guessing the vendor from a
+// human-written subject line.
+function parseBeneficiary(text) {
+  const m = /(?:holder name|paynow recipient name|beneficiary name)\s*:\s*(.+)/i.exec(text)
+  if (!m) return null
+  const name = m[1].trim().replace(/[*_]/g, '')
+  return name || null
+}
+
+// Every OCBC advice opens with "Our customer, <ENTITY>, would like us to
+// inform you..." — <ENTITY> is which Initia subsidiary actually paid.
+// Matching vendor + amount is not enough to settle a row: two different
+// Initia entities can independently pay the same vendor the same exact
+// amount (e.g. two outlets both ordering from the same supplier), and
+// without this check that coincidence reads as a confirmed payment for the
+// wrong entity's request.
+function parsePayerEntity(text) {
+  const m = /our customer,\s*([^,]+),/i.exec(text)
+  if (!m) return null
+  return m[1].trim() || null
 }
 
 // Subjects use at least three templates:
@@ -251,35 +298,71 @@ async function main() {
     const isSent = msg.labelIds.includes('SENT')
     if (!(subjectMatches && fromMe && toAccounts && isSent)) continue
 
+    // Only the newly-typed portion of the message — a reply that merely
+    // quotes the original request (e.g. a one-line "please disregard" on top
+    // of the quoted original) must not have its quoted Amount:/intent lines
+    // re-parsed as if they were new.
+    const newContent = stripQuotedText(msg.body)
+
     const existing = byMsgId.get(msg.id)
     if (existing) {
-      if (existing.status === 'pending' && isDisregard(msg.body)) {
+      if (existing.status === 'pending' && isDisregard(newContent)) {
         await supabase.from('payment_requests').update({
           status: 'cancelled',
           notes: `${existing.notes || ''} Cancelled per follow-up email on ${new Date().toISOString().slice(0, 10)}.`.trim(),
         }).eq('id', existing.id)
+        existing.status = 'cancelled'
         cancelled++
       }
       continue
     }
 
-    if (!hasIntentLine(msg.body)) continue
-    const parsedAmount = parseAmountLine(msg.body)
+    // A reply in an already-tracked thread saying to disregard/cancel: cancel
+    // the pending row(s) in that thread here, before falling through to the
+    // "new request" parsing below — otherwise the quoted original's Amount:
+    // line would get parsed out of newContent... except newContent has that
+    // quote stripped, so without this check the disregard reply would simply
+    // be ignored (no intent line of its own) and the original row would be
+    // stuck pending forever instead of being cancelled.
+    if (isDisregard(newContent)) {
+      const pendingInThread = runRows.filter((r) => r.request_thread_id === msg.threadId && r.status === 'pending')
+      if (pendingInThread.length) {
+        for (const row of pendingInThread) {
+          await supabase.from('payment_requests').update({
+            status: 'cancelled',
+            notes: `${row.notes || ''} Cancelled per follow-up email on ${new Date().toISOString().slice(0, 10)}.`.trim(),
+          }).eq('id', row.id)
+          row.status = 'cancelled'
+          cancelled++
+        }
+        continue
+      }
+    }
+
+    if (!hasIntentLine(newContent)) continue
+    const parsedAmount = parseAmountLine(newContent)
     if (!parsedAmount) continue
+
+    // Prefer the bank-verified beneficiary name (present in every request
+    // email's "Beneficiary information" block) over the subject-line guess —
+    // it's the exact string the OCBC advice will echo back in Phase 2, so
+    // matching against it there is far more reliable than a subject guess.
+    const vendorGuess = parseVendorFromSubject(msg.subject)
+    const beneficiary = parseBeneficiary(newContent)
+    const vendorFull = beneficiary || vendorGuess
 
     // T2: not a re-send of an already-tracked request (same loose vendor + same
     // amount, from a DIFFERENT thread — same-thread matches are the legitimate
     // 50% deposit -> balance case).
-    const vendorGuess = parseVendorFromSubject(msg.subject)
     const isDuplicate = runRows.some((r) =>
       r.request_thread_id !== msg.threadId &&
       Number(r.amount) === parsedAmount.amount &&
-      looseVendorMatch(r.vendor_full || r.vendor, vendorGuess)
+      looseVendorMatch(r.vendor_full || r.vendor, vendorFull)
     )
     if (isDuplicate) continue
 
-    const dueDate = parseDueDate(msg.body)
-    const entity = parseEntity(msg.body)
+    const dueDate = parseDueDate(newContent)
+    const entity = parseEntity(newContent)
     const dateSent = msg.date ? new Date(msg.date).toISOString().slice(0, 10) : new Date().toISOString().slice(0, 10)
     const verifyFlags = []
     if (!dueDate) verifyFlags.push('due date')
@@ -289,8 +372,8 @@ async function main() {
       request_thread_id: msg.threadId,
       date_sent: dateSent,
       vendor: vendorGuess.slice(0, 80),
-      vendor_full: vendorGuess,
-      description: parseDescription(msg.body, msg.subject.replace(/^(re|fwd):\s*/i, '')),
+      vendor_full: vendorFull,
+      description: parseDescription(newContent, msg.subject.replace(/^(re|fwd):\s*/i, '')),
       entity: entity ? entity.short : 'Initia International',
       entity_full: entity ? entity.full : 'Initia International Pte Ltd',
       amount: parsedAmount.amount,
@@ -316,6 +399,17 @@ async function main() {
     .sort((a, b) => (a.due_date > b.due_date ? 1 : -1))
     .slice(0, 15)
 
+  // A slip settles at most one row per run. Message id alone isn't enough:
+  // OCBC delivers the SAME transaction to more than one recipient (e.g. a
+  // direct notification plus a copy forwarded through a shared alias),
+  // producing two different Gmail message ids with the identical OCBC
+  // reference / SWIFT UETR for one real transfer. The OCBC reference is the
+  // actual unique transaction id, so that's the key that must not repeat —
+  // dedupe by message id too, only to also cover the Accounts-reply fallback
+  // path below, which has no OCBC reference to key off of.
+  const usedSlipMessageIds = new Set(freshRows.filter((r) => r.slip_message_id).map((r) => r.slip_message_id))
+  const usedSlipRefs = new Set(freshRows.filter((r) => r.ref).map((r) => r.ref))
+
   for (const row of eligible) {
     const { plain, grouped } = amountVariants(row.amount)
     let queries = [`subject:"details of a transaction" ("${grouped}" OR "${plain}") newer_than:30d`]
@@ -325,16 +419,32 @@ async function main() {
     for (const q of queries) {
       const ids = await searchMessageIds(token, q, 20)
       for (const id of ids) {
+        if (usedSlipMessageIds.has(id)) continue
         const msg = await getMessage(token, id)
         const amtMatch = new RegExp(`transaction amount:\\s*${row.currency}\\s*${plain.replace('.', '\\.')}`, 'i').test(msg.body)
           || msg.body.includes(grouped)
         const nameMatch = /(?:PayNow Recipient Name|Name):\s*(.+)/i.exec(msg.body)
         const beneficiary = nameMatch ? nameMatch[1].split('\n')[0].trim() : ''
         const beneficiaryMatches = beneficiary && looseVendorMatch(beneficiary, row.vendor_full || row.vendor)
+        const payerEntity = parsePayerEntity(msg.body)
+        const entityMatches = !payerEntity || looseVendorMatch(payerEntity, row.entity_full || row.entity)
         const refMatch = /OCBC reference no\.?:\s*(\S+)/i.exec(msg.body)
         const dateMatch = /Value date[^:]*:\s*(\d{1,2}\s+\w+\s+\d{4})/i.exec(msg.body)
 
-        if (amtMatch && beneficiaryMatches) {
+        // Same real transfer delivered as a second copy to another
+        // recipient — already claimed by another row, so this can't settle
+        // this one too, no matter how well the amount/name happen to match.
+        if (refMatch && usedSlipRefs.has(refMatch[1])) continue
+
+        // A slip dated before the request was even sent can't be this
+        // payment — reject it outright rather than let a stale,
+        // coincidentally-sized payment settle the row.
+        if (dateMatch) {
+          const valueDate = new Date(dateMatch[1])
+          if (!Number.isNaN(valueDate.getTime()) && valueDate < new Date(row.date_sent)) continue
+        }
+
+        if (amtMatch && beneficiaryMatches && entityMatches) {
           const paymentDate = dateMatch ? new Date(dateMatch[1]).toISOString().slice(0, 10) : new Date().toISOString().slice(0, 10)
           await supabase.from('payment_requests').update({
             status: 'done',
@@ -344,9 +454,24 @@ async function main() {
             slip_url: gmailUrl(msg.id),
             notes: `OCBC advice confirms ${row.currency} ${plain}, value date ${dateMatch ? dateMatch[1] : 'unknown'}${refMatch ? `, ref ${refMatch[1]}` : ''}.`,
           }).eq('id', row.id)
+          usedSlipMessageIds.add(msg.id)
+          if (refMatch) usedSlipRefs.add(refMatch[1])
           settled++
           matched = true
           break
+        } else if (amtMatch && beneficiaryMatches && !entityMatches && !matched) {
+          // Right vendor, right amount — but paid by a different Initia
+          // entity than this request was billed under. Two entities can
+          // genuinely pay the same vendor the same amount independently, so
+          // this must never auto-settle; leave a breadcrumb naming the
+          // mismatch instead. Guarded so reruns don't pile up duplicates.
+          const breadcrumb = `Possible payment seen: OCBC ${row.currency} ${plain}${refMatch ? ` ref ${refMatch[1]}` : ''} was paid by "${payerEntity}", not "${row.entity_full || row.entity}" — verify this is the right transaction.`
+          if (!(row.notes || '').includes(breadcrumb)) {
+            await supabase.from('payment_requests').update({
+              notes: `${row.notes || ''} ${breadcrumb}`.trim(),
+            }).eq('id', row.id)
+            row.notes = `${row.notes || ''} ${breadcrumb}`.trim()
+          }
         } else if (amtMatch && !matched) {
           // Near miss: right amount, unconfirmed beneficiary — leave a breadcrumb, don't
           // settle. Guarded so reruns don't pile up the same breadcrumb every 30 minutes.
@@ -368,8 +493,12 @@ async function main() {
       const threadMsgs = await getThreadMessages(token, row.request_thread_id)
       const slipReply = threadMsgs.find((m) =>
         m.id !== row.request_message_id &&
-        (/@initiagroup\.sg$/i.test(m.from) || /^accounts/i.test(m.from) || /procurement@initia\.sg/i.test(m.from)) &&
-        /(payment slip|slip attached|kindly see the attached|attached payment slip)/i.test(m.body) &&
+        !usedSlipMessageIds.has(m.id) &&
+        // Fixed: the original `/@initiagroup\.sg$/` anchor never matched
+        // because From headers look like "Accounts Team <accounts@initiagroup.sg>"
+        // — the domain is followed by ">", not end-of-string.
+        (/@initiagroup\.sg/i.test(m.from) || /^accounts/i.test(m.from) || /procurement@initia\.sg/i.test(m.from)) &&
+        /(payment slip|slip attached|kindly see the attached|attached payment slip|proof of payment|remittance advice|payment (?:has been made|completed))/i.test(m.body) &&
         m.hasAttachment
       )
       if (slipReply) {
@@ -380,6 +509,7 @@ async function main() {
           slip_url: gmailUrl(slipReply.id),
           notes: `Payment slip received from Accounts on ${new Date(slipReply.date).toISOString().slice(0, 10)} (slip attached in the request thread).`,
         }).eq('id', row.id)
+        usedSlipMessageIds.add(slipReply.id)
         settled++
       }
     } catch (e) {
