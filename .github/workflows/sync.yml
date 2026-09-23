@@ -21,7 +21,13 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 22
-      - run: npm install --omit=dev --no-save @supabase/supabase-js
+          cache: npm
+      # `npm ci` installs exactly what package-lock.json pins. The previous
+      # `npm install --no-save @supabase/supabase-js` ignored the lockfile
+      # and re-resolved transitive deps (e.g. @supabase/storage-js) to
+      # whatever "latest" was at run time — which 404s if that version gets
+      # unpublished or the registry hiccups. The lockfile is deterministic.
+      - run: npm ci --omit=dev
       - name: Run sync
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
